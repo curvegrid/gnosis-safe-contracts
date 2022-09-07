@@ -279,7 +279,7 @@ contract GnosisSafe is
         bytes32 r,
         bytes32 s,
         bytes32 dataHash
-    ) public view returns (address, bytes32) {
+    ) public pure returns (address, bytes32) {
         bytes32 encodedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", dataHash));
         address currentOwner = ecrecover(encodedHash, v - 4, r, s);
 
