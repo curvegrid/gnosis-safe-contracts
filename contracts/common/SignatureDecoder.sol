@@ -9,7 +9,7 @@ contract SignatureDecoder {
     /// @param pos which signature to read. A prior bounds check of this parameter should be performed, to avoid out of bounds access
     /// @param signatures concatenated rsv signatures
     function signatureSplit(bytes memory signatures, uint256 pos)
-        internal
+        public
         pure
         returns (
             uint8 v,

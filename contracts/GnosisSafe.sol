@@ -123,22 +123,21 @@ contract GnosisSafe is
         bytes32 txHash;
         // Use scope here to limit variable lifetime and prevent `stack too deep` errors
         {
-            bytes memory txHashData =
-                encodeTransactionData(
-                    // Transaction info
-                    to,
-                    value,
-                    data,
-                    operation,
-                    safeTxGas,
-                    // Payment info
-                    baseGas,
-                    gasPrice,
-                    gasToken,
-                    refundReceiver,
-                    // Signature info
-                    nonce
-                );
+            bytes memory txHashData = encodeTransactionData(
+                // Transaction info
+                to,
+                value,
+                data,
+                operation,
+                safeTxGas,
+                // Payment info
+                baseGas,
+                gasPrice,
+                gasToken,
+                refundReceiver,
+                // Signature info
+                nonce
+            );
             // Increase nonce and execute transaction.
             nonce++;
             txHash = keccak256(txHashData);
@@ -230,6 +229,72 @@ contract GnosisSafe is
         checkNSignatures(dataHash, data, signatures, _threshold);
     }
 
+    function v0(
+        bytes32 r,
+        bytes32 s,
+        bytes memory data,
+        bytes memory signatures,
+        uint256 requiredSignatures
+    ) public view returns (address) {
+        address currentOwner = address(uint160(uint256(r)));
+
+        // Check that signature data pointer (s) is not pointing inside the static part of the signatures bytes
+        // This check is not completely accurate, since it is possible that more signatures than the threshold are send.
+        // Here we only check that the pointer is not pointing inside the part that is being processed
+        require(uint256(s) >= requiredSignatures.mul(65), "GS021");
+
+        // Check that signature data pointer (s) is in bounds (points to the length of data -> 32 bytes)
+        require(uint256(s).add(32) <= signatures.length, "GS022");
+
+        // Check if the contract signature is in bounds: start of data is s + 32 and end is start + signature length
+        uint256 contractSignatureLen;
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            contractSignatureLen := mload(add(add(signatures, s), 0x20))
+        }
+        require(uint256(s).add(32).add(contractSignatureLen) <= signatures.length, "GS023");
+
+        // Check signature
+        bytes memory contractSignature;
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            // The signature data for contract signatures is appended to the concatenated signatures and the offset is stored in s
+            contractSignature := add(add(signatures, s), 0x20)
+        }
+        require(ISignatureValidator(currentOwner).isValidSignature(data, contractSignature) == EIP1271_MAGIC_VALUE, "GS024");
+
+        return currentOwner;
+    }
+
+    function v1(bytes32 r, bytes32 dataHash) public view returns (address) {
+        address currentOwner = address(uint160(uint256(r)));
+        // Hashes are automatically approved by the sender of the message or when they have been pre-approved via a separate transaction
+        require(msg.sender == currentOwner || approvedHashes[currentOwner][dataHash] != 0, "GS025");
+
+        return currentOwner;
+    }
+
+    function v30plus(
+        uint8 v,
+        bytes32 r,
+        bytes32 s,
+        bytes32 dataHash
+    ) public view returns (address, bytes32) {
+        bytes32 encodedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", dataHash));
+        address currentOwner = ecrecover(encodedHash, v - 4, r, s);
+
+        return (currentOwner, encodedHash);
+    }
+
+    function velse(
+        uint8 v,
+        bytes32 r,
+        bytes32 s,
+        bytes32 dataHash
+    ) public pure returns (address) {
+        return ecrecover(dataHash, v, r, s);
+    }
+
     /**
      * @dev Checks whether the signature provided is valid for the provided data, hash. Will revert otherwise.
      * @param dataHash Hash of the data (could be either a message hash or transaction hash)
@@ -257,48 +322,23 @@ contract GnosisSafe is
             if (v == 0) {
                 // If v is 0 then it is a contract signature
                 // When handling contract signatures the address of the contract is encoded into r
-                currentOwner = address(uint160(uint256(r)));
-
-                // Check that signature data pointer (s) is not pointing inside the static part of the signatures bytes
-                // This check is not completely accurate, since it is possible that more signatures than the threshold are send.
-                // Here we only check that the pointer is not pointing inside the part that is being processed
-                require(uint256(s) >= requiredSignatures.mul(65), "GS021");
-
-                // Check that signature data pointer (s) is in bounds (points to the length of data -> 32 bytes)
-                require(uint256(s).add(32) <= signatures.length, "GS022");
-
-                // Check if the contract signature is in bounds: start of data is s + 32 and end is start + signature length
-                uint256 contractSignatureLen;
-                // solhint-disable-next-line no-inline-assembly
-                assembly {
-                    contractSignatureLen := mload(add(add(signatures, s), 0x20))
-                }
-                require(uint256(s).add(32).add(contractSignatureLen) <= signatures.length, "GS023");
-
-                // Check signature
-                bytes memory contractSignature;
-                // solhint-disable-next-line no-inline-assembly
-                assembly {
-                    // The signature data for contract signatures is appended to the concatenated signatures and the offset is stored in s
-                    contractSignature := add(add(signatures, s), 0x20)
-                }
-                require(ISignatureValidator(currentOwner).isValidSignature(data, contractSignature) == EIP1271_MAGIC_VALUE, "GS024");
+                currentOwner = v0(r, s, data, signatures, requiredSignatures);
             } else if (v == 1) {
                 // If v is 1 then it is an approved hash
                 // When handling approved hashes the address of the approver is encoded into r
-                currentOwner = address(uint160(uint256(r)));
-                // Hashes are automatically approved by the sender of the message or when they have been pre-approved via a separate transaction
-                require(msg.sender == currentOwner || approvedHashes[currentOwner][dataHash] != 0, "GS025");
+                currentOwner = v1(r, dataHash);
             } else if (v > 30) {
                 // If v > 30 then default va (27,28) has been adjusted for eth_sign flow
                 // To support eth_sign and similar we adjust v and hash the messageHash with the Ethereum message prefix before applying ecrecover
-                currentOwner = ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", dataHash)), v - 4, r, s);
+                (currentOwner, ) = v30plus(v, r, s, dataHash);
             } else {
                 // Default is the ecrecover flow with the provided data hash
                 // Use ecrecover with the messageHash for EOA signatures
-                currentOwner = ecrecover(dataHash, v, r, s);
+                currentOwner = velse(v, r, s, dataHash);
             }
-            require(currentOwner > lastOwner && owners[currentOwner] != address(0) && currentOwner != SENTINEL_OWNERS, "GS026");
+            require(currentOwner > lastOwner, "GS026a");
+            require(owners[currentOwner] != address(0), "GS026b");
+            require(currentOwner != SENTINEL_OWNERS, "GS026c");
             lastOwner = currentOwner;
         }
     }
@@ -374,22 +414,21 @@ contract GnosisSafe is
         address refundReceiver,
         uint256 _nonce
     ) public view returns (bytes memory) {
-        bytes32 safeTxHash =
-            keccak256(
-                abi.encode(
-                    SAFE_TX_TYPEHASH,
-                    to,
-                    value,
-                    keccak256(data),
-                    operation,
-                    safeTxGas,
-                    baseGas,
-                    gasPrice,
-                    gasToken,
-                    refundReceiver,
-                    _nonce
-                )
-            );
+        bytes32 safeTxHash = keccak256(
+            abi.encode(
+                SAFE_TX_TYPEHASH,
+                to,
+                value,
+                keccak256(data),
+                operation,
+                safeTxGas,
+                baseGas,
+                gasPrice,
+                gasToken,
+                refundReceiver,
+                _nonce
+            )
+        );
         return abi.encodePacked(bytes1(0x19), bytes1(0x01), domainSeparator(), safeTxHash);
     }
 
